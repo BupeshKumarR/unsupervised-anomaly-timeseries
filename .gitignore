@@ -1,0 +1,8 @@
+# .gitignore
+
+# Virtual environments
+venv/
+.env/
+
+# Dataset
+data/raw/
