@@ -1,18 +1,17 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import shap
-import matplotlib.pyplot as plt
-
+import time
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
+import shap
 
-# --- Page Config ---
+# ------------------ App Config ------------------
 st.set_page_config(page_title="⚡ PowerGrid Live Monitor", layout="wide")
 st.title("⚡ Real-Time Smart Meter Monitoring")
 st.markdown("Simulating live anomaly detection with streaming data.")
 
-# --- Load data ---
+# ------------------ Load Data ------------------
 @st.cache_data
 def load_data():
     df = pd.read_csv("data/processed/sample_power_data.csv", parse_dates=["datetime"])
@@ -21,35 +20,39 @@ def load_data():
 
 df = load_data()
 
-# --- Init session state ---
+# ------------------ Session State Init ------------------
 if "current_idx" not in st.session_state:
     st.session_state.current_idx = 0
 if "window_data" not in st.session_state:
-    st.session_state.window_data = df.iloc[0:0].copy()
+    st.session_state.window_data = pd.DataFrame(columns=df.columns)
 if "paused" not in st.session_state:
     st.session_state.paused = False
-if "latest_shap" not in st.session_state:
-    st.session_state.latest_shap = None
 
-# --- Controls ---
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("⏸️ Pause", use_container_width=True):
-        st.session_state.paused = True
-with col2:
-    if st.button("▶️ Resume", use_container_width=True):
-        st.session_state.paused = False
-
-# --- Main logic ---
+# ------------------ Parameters ------------------
 WINDOW_SIZE = 120
+REFRESH_RATE = 0.5  # seconds
 FEATURES = ["Global_active_power", "Global_reactive_power", "Voltage", "Global_intensity"]
 
-if not st.session_state.paused and st.session_state.current_idx < len(df):
+# ------------------ Controls ------------------
+col1, col2 = st.columns([1, 5])
+with col1:
+    if st.button("⏸ Pause" if not st.session_state.paused else "▶️ Resume"):
+        st.session_state.paused = not st.session_state.paused
+
+# ------------------ Placeholders ------------------
+placeholder = st.empty()
+alert_placeholder = st.empty()
+
+# ------------------ Main Loop ------------------
+while st.session_state.current_idx < len(df):
+
+    if st.session_state.paused:
+        time.sleep(0.1)
+        continue
 
     next_row = df.iloc[st.session_state.current_idx]
     st.session_state.window_data = pd.concat(
-        [st.session_state.window_data, pd.DataFrame([next_row])],
-        ignore_index=True
+        [st.session_state.window_data, pd.DataFrame([next_row])]
     ).tail(WINDOW_SIZE)
 
     if len(st.session_state.window_data) >= 60:
@@ -60,63 +63,63 @@ if not st.session_state.paused and st.session_state.current_idx < len(df):
         model = IsolationForest(contamination=0.02, random_state=42)
         preds = model.fit_predict(X_scaled)
         st.session_state.window_data["anomaly_live"] = (preds == -1).astype(int)
-
-        # SHAP only for last anomaly
-        anomalies = st.session_state.window_data[st.session_state.window_data["anomaly_live"] == 1]
-        if not anomalies.empty:
-            latest_idx = anomalies.index[-1]
-            explainer = shap.Explainer(model, X)
-            shap_vals = explainer(X)
-            st.session_state.latest_shap = shap_vals[latest_idx]
     else:
         st.session_state.window_data["anomaly_live"] = 0
 
+    anomalies = st.session_state.window_data[st.session_state.window_data["anomaly_live"] == 1]
+
+    with placeholder.container():
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=st.session_state.window_data["datetime"],
+            y=st.session_state.window_data["Global_active_power"],
+            mode='lines',
+            name='Power (kW)',
+            line=dict(color='blue')
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=anomalies["datetime"],
+            y=anomalies["Global_active_power"],
+            mode='markers',
+            name='Anomaly',
+            marker=dict(color='red', size=7, symbol='x')
+        ))
+
+        fig.update_layout(
+            height=400,
+            title="Live Power Usage with Anomaly Detection",
+            xaxis_title="Time",
+            yaxis_title="Power (kW)",
+            showlegend=True,
+            margin=dict(t=50, b=30)
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        if anomalies.shape[0] > 0:
+            alert_placeholder.warning(f"\U0001F6A8 {len(anomalies)} anomaly{'ies' if len(anomalies)>1 else ''} detected in the last {WINDOW_SIZE} readings!", icon="⚠️")
+
+            latest_anomaly = anomalies.iloc[-1]
+            latest_idx = st.session_state.window_data.index.get_loc(latest_anomaly.name)
+
+            try:
+                explainer = shap.Explainer(model, X_scaled)
+                shap_vals = explainer(X_scaled)
+
+                if latest_idx < len(shap_vals):
+                    base_val = shap_vals.base_values[latest_idx]
+                    st.markdown("### 📊 SHAP Explanation for Latest Anomaly")
+                    st.text(f"Base value: {base_val:.4f}")
+                    st.text("Feature contributions:")
+                    for feat, val in zip(FEATURES, shap_vals[latest_idx].values):
+                        st.text(f"{feat}: {val:.4f}")
+                else:
+                    st.warning("⚠️ SHAP explanation not available for this anomaly (index out of range).")
+            except Exception as e:
+                st.error(f"SHAP explanation failed: {e}")
+        else:
+            alert_placeholder.info("✅ No anomalies detected in current window.", icon="✅")
+
     st.session_state.current_idx += 1
-
-# --- Plot ---
-plot_placeholder = st.empty()
-fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=st.session_state.window_data["datetime"],
-    y=st.session_state.window_data["Global_active_power"],
-    mode="lines",
-    name="Power (kW)",
-    line=dict(color="blue")
-))
-anomalies = st.session_state.window_data[st.session_state.window_data["anomaly_live"] == 1]
-fig.add_trace(go.Scatter(
-    x=anomalies["datetime"],
-    y=anomalies["Global_active_power"],
-    mode="markers",
-    name="Anomaly",
-    marker=dict(color="red", size=7, symbol="x")
-))
-fig.update_layout(
-    height=400,
-    title="Live Power Usage with Anomaly Detection",
-    xaxis_title="Time",
-    yaxis_title="Power (kW)",
-    showlegend=True,
-    margin=dict(t=50, b=30)
-)
-plot_placeholder.plotly_chart(fig, use_container_width=True)
-
-# --- Alert ---
-if anomalies.shape[0] > 0:
-    st.warning(
-        f"🚨 {len(anomalies)} anomaly{'ies' if len(anomalies) > 1 else ''} detected in last {WINDOW_SIZE} readings!",
-        icon="⚠️"
-    )
-else:
-    st.info("✅ No anomalies detected in current window.", icon="✅")
-
-# --- SHAP when paused ---
-if st.session_state.paused and st.session_state.latest_shap is not None:
-    st.subheader("📊 SHAP Explanation for Latest Anomaly")
-    fig_shap, ax = plt.subplots()
-    shap.plots.bar(st.session_state.latest_shap, show=False)
-    st.pyplot(fig_shap, use_container_width=True)
-
-# --- Trigger refresh ---
-if not st.session_state.paused:
-    st.rerun()
+    time.sleep(REFRESH_RATE)
